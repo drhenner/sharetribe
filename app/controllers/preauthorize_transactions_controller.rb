@@ -46,27 +46,40 @@ class PreauthorizeTransactionsController < ApplicationController
       return redirect_to error_not_found_path
     end
 
-    quantity = TransactionViewUtils.parse_quantity(params[:quantity])
+    quantity_data = parse_quantity_data(@listing, params)
+
+    quantity = quantity_data[:quantity]
 
     vprms = view_params(listing_id: params[:listing_id],
                         quantity: quantity,
                         shipping_enabled: delivery_method == :shipping)
 
+    Maybe(quantity_data)[:booking_parse_error].each { |booking_parse_error|
+      flash[:error] = booking_parse_error
+      return redirect_to listing_path(vprms[:listing][:id])
+    }
+
     community_country_code = LocalizationUtils.valid_country_code(@current_community.country)
 
     price_break_down_locals = TransactionViewUtils.price_break_down_locals({
-      booking:  false,
-      quantity: quantity,
+      booking:  quantity_data[:booking],
+      quantity: quantity_data[:quantity],
+      start_on: quantity_data[:start_on],
+      end_on:   quantity_data[:end_on],
+      duration: quantity_data[:duration],
       listing_price: vprms[:listing][:price],
       localized_unit_type: translate_unit_from_listing(vprms[:listing]),
       localized_selector_label: translate_selector_label_from_listing(vprms[:listing]),
-      subtotal: (quantity > 1 || vprms[:listing][:shipping_price].present?) ? vprms[:subtotal] : nil,
+      subtotal: subtotal_to_show(quantity: quantity, shipping_price: vprms[:listing][:shipping_price], subtotal: vprms[:subtotal]),
       shipping_price: delivery_method == :shipping ? vprms[:shipping_price] : nil,
       total: vprms[:total_price]
     })
 
     render "listing_conversations/initiate", locals: {
-      preauthorize_form: PreauthorizeMessageForm.new,
+      preauthorize_form: PreauthorizeBookingForm.new({
+          start_on: quantity_data[:start_on],
+          end_on: quantity_data[:end_on]
+      }),
       listing: vprms[:listing],
       delivery_method: delivery_method,
       quantity: quantity,
@@ -132,55 +145,6 @@ class PreauthorizeTransactionsController < ApplicationController
         op_error_msg: t("error_messages.paypal.generic_error")
       }
     end
-  end
-
-  def book
-    delivery_method = valid_delivery_method(delivery_method_str: params[:delivery],
-                                            shipping: @listing.require_shipping_address,
-                                            pickup: @listing.pickup_enabled)
-    if(delivery_method == :errored)
-      return redirect_to error_not_found_path
-    end
-
-    booking_data = verified_booking_data(params[:start_on], params[:end_on])
-    vprms = view_params(listing_id: params[:listing_id],
-                        quantity: booking_data[:duration],
-                        shipping_enabled: delivery_method == :shipping)
-
-    if booking_data[:error].present?
-      flash[:error] = booking_data[:error]
-      return redirect_to listing_path(vprms[:listing][:id])
-    end
-
-    community_country_code = LocalizationUtils.valid_country_code(@current_community.country)
-
-    price_break_down_locals = TransactionViewUtils.price_break_down_locals({
-      booking:  true,
-      start_on: booking_data[:start_on],
-      end_on:   booking_data[:end_on],
-      duration: booking_data[:duration],
-      listing_price: vprms[:listing][:price],
-      localized_unit_type: translate_unit_from_listing(vprms[:listing]),
-      localized_selector_label: translate_selector_label_from_listing(vprms[:listing]),
-      subtotal: vprms[:subtotal],
-      shipping_price: delivery_method == :shipping ? vprms[:shipping_price] : nil,
-      total: vprms[:total_price]
-    })
-
-    render "listing_conversations/initiate", locals: {
-      preauthorize_form: PreauthorizeBookingForm.new({
-          start_on: booking_data[:start_on],
-          end_on: booking_data[:end_on]
-      }),
-      listing: vprms[:listing],
-      delivery_method: delivery_method,
-      author: query_person_entity(vprms[:listing][:author_id]),
-      action_button_label: vprms[:action_button_label],
-      expiration_period: MarketplaceService::Transaction::Entity.authorization_expiration_period(:paypal),
-      form_action: booked_path(person_id: @current_user.id, listing_id: vprms[:listing][:id]),
-      price_break_down_locals: price_break_down_locals,
-      country_code: community_country_code
-    }
   end
 
   def booked
@@ -283,6 +247,38 @@ class PreauthorizeTransactionsController < ApplicationController
       subtotal: subtotal,
       shipping_price: shipping_price,
       total_price: total_price }
+  end
+
+  def subtotal_to_show(quantity:, shipping_price:, subtotal:)
+    (quantity > 1 || shipping_price.present?) ? subtotal : nil
+  end
+
+  def booking?(listing)
+    [:day].include?(listing.unit_type&.to_sym)
+  end
+
+  def parse_quantity_data(listing, params)
+    if booking?(listing)
+      booking = verified_booking_data(params[:start_on], params[:end_on])
+
+      {
+        booking: true,
+        start_on: booking[:start_on],
+        end_on: booking[:end_on],
+        quantity: booking[:duration],
+        duration: booking[:duration],
+        booking_parse_error: booking[:error]
+      }
+    else
+      {
+        booking: false,
+        start_on: nil,
+        end_on: nil,
+        quantity: TransactionViewUtils.parse_quantity(params[:quantity]),
+        duration: nil,
+        booking_parse_error: nil,
+      }
+    end
   end
 
   def render_error_response(is_xhr, error_msg, redirect_params)
