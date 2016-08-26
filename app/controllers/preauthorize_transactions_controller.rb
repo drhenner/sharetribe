@@ -52,6 +52,8 @@ class PreauthorizeTransactionsController < ApplicationController
                         quantity: quantity,
                         shipping_enabled: delivery_method == :shipping)
 
+    community_country_code = LocalizationUtils.valid_country_code(@current_community.country)
+
     price_break_down_locals = TransactionViewUtils.price_break_down_locals({
       booking:  false,
       quantity: quantity,
@@ -63,8 +65,6 @@ class PreauthorizeTransactionsController < ApplicationController
       total: vprms[:total_price]
     })
 
-    community_country_code = LocalizationUtils.valid_country_code(@current_community.country)
-
     render "listing_conversations/initiate", locals: {
       preauthorize_form: PreauthorizeMessageForm.new,
       listing: vprms[:listing],
@@ -72,7 +72,7 @@ class PreauthorizeTransactionsController < ApplicationController
       quantity: quantity,
       author: query_person_entity(vprms[:listing][:author_id]),
       action_button_label: vprms[:action_button_label],
-      expiration_period: MarketplaceService::Transaction::Entity.authorization_expiration_period(vprms[:payment_type]),
+      expiration_period: MarketplaceService::Transaction::Entity.authorization_expiration_period(:paypal),
       form_action: initiated_order_path(person_id: @current_user.id, listing_id: vprms[:listing][:id]),
       price_break_down_locals: price_break_down_locals,
       country_code: community_country_code
@@ -172,21 +172,25 @@ class PreauthorizeTransactionsController < ApplicationController
           start_on: booking_data[:start_on],
           end_on: booking_data[:end_on]
       }),
-      country_code: community_country_code,
       listing: vprms[:listing],
       delivery_method: delivery_method,
-      subtotal: vprms[:subtotal],
       author: query_person_entity(vprms[:listing][:author_id]),
       action_button_label: vprms[:action_button_label],
-      expiration_period: MarketplaceService::Transaction::Entity.authorization_expiration_period(vprms[:payment_type]),
+      expiration_period: MarketplaceService::Transaction::Entity.authorization_expiration_period(:paypal),
       form_action: booked_path(person_id: @current_user.id, listing_id: vprms[:listing][:id]),
-      price_break_down_locals: price_break_down_locals
+      price_break_down_locals: price_break_down_locals,
+      country_code: community_country_code
     }
   end
 
   def booked
-    payment_type = MarketplaceService::Community::Query.payment_type(@current_community.id)
     conversation_params = params[:listing_conversation]
+
+    if @current_community.transaction_agreement_in_use? && conversation_params[:contract_agreed] != "1"
+      return render_error_response(request.xhr?,
+        t("error_messages.transaction_agreement.required_error"),
+        { action: :book, start_on: TransactionViewUtils.stringify_booking_date(start_on), end_on: TransactionViewUtils.stringify_booking_date(end_on) })
+    end
 
     start_on = DateUtils.from_date_select(conversation_params, :start_on)
     end_on = DateUtils.from_date_select(conversation_params, :end_on)
@@ -196,10 +200,10 @@ class PreauthorizeTransactionsController < ApplicationController
       listing_id: @listing.id
     }))
 
-    if @current_community.transaction_agreement_in_use? && conversation_params[:contract_agreed] != "1"
+    unless preauthorize_form.valid?
       return render_error_response(request.xhr?,
-        t("error_messages.transaction_agreement.required_error"),
-        { action: :book, start_on: TransactionViewUtils.stringify_booking_date(start_on), end_on: TransactionViewUtils.stringify_booking_date(end_on) })
+        preauthorize_form.errors.full_messages.join(", "),
+       { action: :book, start_on: TransactionViewUtils.stringify_booking_date(start_on), end_on: TransactionViewUtils.stringify_booking_date(end_on) })
     end
 
     delivery_method = valid_delivery_method(delivery_method_str: preauthorize_form.delivery_method,
@@ -209,18 +213,15 @@ class PreauthorizeTransactionsController < ApplicationController
       return render_error_response(request.xhr?, "Delivery method is invalid.", action: :booked)
     end
 
-    unless preauthorize_form.valid?
-      return render_error_response(request.xhr?,
-        preauthorize_form.errors.full_messages.join(", "),
-       { action: :book, start_on: TransactionViewUtils.stringify_booking_date(start_on), end_on: TransactionViewUtils.stringify_booking_date(end_on) })
-    end
+    quantity = DateUtils.duration_days(preauthorize_form.start_on, preauthorize_form.end_on)
+    shipping_price = shipping_price_total(@listing.shipping_price, @listing.shipping_price_additional, quantity)
 
     transaction_response = create_preauth_transaction(
-      payment_type: payment_type,
+      payment_type: :paypal,
       community: @current_community,
       listing: @listing,
+      listing_quantity: quantity,
       user: @current_user,
-      listing_quantity: DateUtils.duration_days(preauthorize_form.start_on, preauthorize_form.end_on),
       content: preauthorize_form.content,
       use_async: request.xhr?,
       delivery_method: delivery_method,
@@ -231,14 +232,7 @@ class PreauthorizeTransactionsController < ApplicationController
       })
 
     unless transaction_response[:success]
-      error =
-        if (payment_type == :paypal)
-          t("error_messages.paypal.generic_error")
-        else
-          "An error occured while trying to create a new transaction: #{transaction_response[:error_msg]}"
-        end
-
-      return render_error_response(request.xhr?, error, { action: :book, start_on: TransactionViewUtils.stringify_booking_date(start_on), end_on: TransactionViewUtils.stringify_booking_date(end_on) })
+      return render_error_response(request.xhr?, t("error_messages.paypal.generic_error"), { action: :book, start_on: TransactionViewUtils.stringify_booking_date(start_on), end_on: TransactionViewUtils.stringify_booking_date(end_on) })
     end
 
     if (transaction_response[:data][:gateway_fields][:redirect_url])
@@ -277,16 +271,14 @@ class PreauthorizeTransactionsController < ApplicationController
 
   def view_params(listing_id:, quantity: 1, shipping_enabled: false)
     listing = ListingQuery.listing(listing_id)
-    payment_type = MarketplaceService::Community::Query.payment_type(@current_community.id)
 
     action_button_label = translate(listing[:action_button_tr_key])
 
     subtotal = listing[:price] * quantity
-    shipping_price = shipping_price_total(listing[:shipping_price], listing[:shipping_price_additional], quantity)
-    total_price = shipping_enabled ? subtotal + shipping_price : subtotal
+    shipping_price = shipping_price_total(listing[:shipping_price], listing[:shipping_price_additional], quantity) || 0
+    total_price = subtotal + shipping_price
 
     { listing: listing,
-      payment_type: payment_type,
       action_button_label: action_button_label,
       subtotal: subtotal,
       shipping_price: shipping_price,
@@ -326,10 +318,6 @@ class PreauthorizeTransactionsController < ApplicationController
 
   def fetch_listing_from_params
     @listing = Listing.find(params[:listing_id] || params[:id])
-  end
-
-  def new_contact_form(conversation_params = {})
-    ContactForm.new(conversation_params.merge({sender_id: @current_user.id, listing_id: @listing.id, community_id: @current_community.id}))
   end
 
   def ensure_can_receive_payment
