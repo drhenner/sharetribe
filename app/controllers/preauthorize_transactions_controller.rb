@@ -41,8 +41,8 @@ class PreauthorizeTransactionsController < ApplicationController
     [:start_on, :date, transform_with: ->(s) { TransactionViewUtils.parse_booking_date(s) }],
     [:end_on, :date, transform_with: ->(s) { TransactionViewUtils.parse_booking_date(s) }],
     [:message, :string],
-    [:quantity, :to_integer, default: 1],
-    [:contract_agreed],
+    [:quantity, transform_with: ->(v) { v.to_i unless v.blank? }],
+    [:contract_agreed, transform_with: ->(v) { v == "1" }],
   )
 
   ListingQuery = MarketplaceService::Listing::Query
@@ -66,11 +66,11 @@ class PreauthorizeTransactionsController < ApplicationController
     def initialize(initial:, additional:, quantity:)
       @initial = initial || 0
       @additional = additional || 0
-      @quantity = quantity || 1
+      @quantity = quantity
     end
 
     def total
-      initial + (additional * quantity)
+      initial + (additional * (quantity - 1))
     end
   end
 
@@ -135,7 +135,7 @@ class PreauthorizeTransactionsController < ApplicationController
         if start_on.nil? || end_on.nil?
           Result::Error.new(nil, code: :dates_missing)
         elsif start_on > end_on
-          Result::Error.new(nil, code: :start_must_be_before_end)
+          Result::Error.new(nil, code: :end_cant_be_before_start)
         else
           Result::Success.new()
         end
@@ -148,7 +148,7 @@ class PreauthorizeTransactionsController < ApplicationController
       contract_agreed = params[:contract_agreed]
 
       if transaction_agreement_in_use
-        if contract_agreed.present?
+        if contract_agreed
           Result::Success.new()
         else
           Result::Error.new(nil, code: :agreement_missing)
@@ -157,22 +157,6 @@ class PreauthorizeTransactionsController < ApplicationController
         Result::Success.new()
       end
     end
-  end
-
-  def add_defaults(params:, shipping_enabled:, pickup_enabled:)
-    default_shipping =
-      case [shipping_enabled, pickup_enabled]
-      when [true, false]
-        {delivery: :shipping}
-      when [false, true]
-        {delivery: :pickup}
-      when [false, false]
-        {delivery: nil}
-      else
-        {}
-      end
-
-    params.merge(default_shipping)
   end
 
   def initiate
@@ -204,18 +188,15 @@ class PreauthorizeTransactionsController < ApplicationController
 
       order_total = OrderTotal.new(
         item_total: item_total,
-        shipping_total: shipping_total
-      )
+        shipping_total: shipping_total)
 
       render "listing_conversations/initiate",
              locals: {
-               preauthorize_form: PreauthorizeMessageForm.new(
-                 start_on: tx_params[:start_on],
-                 end_on: tx_params[:end_on]
-               ),
+               start_on: tx_params[:start_on],
+               end_on: tx_params[:end_on],
                listing: listing_entity,
                delivery_method: tx_params[:delivery],
-               quantity: quantity,
+               quantity: tx_params[:quantity],
                author: query_person_entity(listing_entity[:author_id]),
                action_button_label: translate(listing_entity[:action_button_tr_key]),
                expiration_period: MarketplaceService::Transaction::Entity.authorization_expiration_period(:paypal),
@@ -236,134 +217,130 @@ class PreauthorizeTransactionsController < ApplicationController
              }
 
     }.on_error { |msg, data|
-      case data[:code]
-      when :dates_missing
-        flash[:error] = "Dates missing"
-        return redirect_to listing_path(listing.id)
-      when :start_must_be_before_end
-        flash[:error] = "Start must be after end"
-        return redirect_to listing_path(listing.id)
-      when :delivery_method_missing
-        flash[:error] = "Delivery method missing"
-        return redirect_to listing_path(listing.id)
-      end
+      error_msg =
+        case data[:code]
+        when :dates_missing
+          t("listing_conversations.preauthorize.booking_dates_missing")
+        when :end_cant_be_before_start
+          t("listing_conversations.preauthorize.end_cant_be_before_start")
+        when :delivery_method_missing
+          t("listing_conversations.preauthorize.delivery_method_missing")
+        end
+
+      flash[:error] = error_msg
+      return redirect_to listing_path(listing.id)
     }
   end
 
   def initiated
-    tx_params = NewTransactionParams.call(params)
+    tx_params = add_defaults(
+      params: NewTransactionParams.call(params),
+      shipping_enabled: listing.require_shipping_address,
+      pickup_enabled: listing.pickup_enabled)
 
-    conversation_params = params[:listing_conversation]
     is_booking = booking?(listing)
 
-    booking_data =
-      if is_booking
-        {
-          start_on: DateUtils.from_date_select(conversation_params, :start_on),
-          end_on: DateUtils.from_date_select(conversation_params, :end_on)
-        }
-      else
-        {}
-      end
+    validation_result = Validator.validate_initiated_params(params: tx_params,
+                                                            is_booking: is_booking,
+                                                            shipping_enabled: listing.require_shipping_address,
+                                                            pickup_enabled: listing.pickup_enabled,
+                                                            transaction_agreement_in_use: @current_community.transaction_agreement_in_use?)
 
-    delivery_method = valid_delivery_method(delivery_method_str: params[:delivery_method],
-                                            shipping: listing.require_shipping_address,
-                                            pickup: listing.pickup_enabled)
-    if delivery_method == :errored
-      return render_error_response(request.xhr?, "Delivery method is invalid.", error_path(booking_data))
-    end
+    validation_result.on_error { |msg, data|
+      error_msg, path =
+                 case data[:code]
+                 when :dates_missing
+                   [t("listing_conversations.preauthorize.booking_dates_missing"), listing_path(listing.id)]
+                 when :end_cant_be_before_start
+                   [t("listing_conversations.preauthorize.end_cant_be_before_start"), listing_path(listing.id)]
+                 when :delivery_method_missing
+                   [t("listing_conversations.preauthorize.delivery_method_missing"), listing_path(listing.id)]
+                 when :agreement_missing
+                   [t("error_messages.transaction_agreement.required_error"), error_path(tx_params)]
+                 else
+                   raise NotImplementedError.new("Unknown error #{data[:code]}")
+                 end
 
-    if @current_community.transaction_agreement_in_use? && conversation_params[:contract_agreed] != "1"
-      return render_error_response(request.xhr?, t("error_messages.transaction_agreement.required_error"), error_path(booking_data))
-    end
+      render_error_response(request.xhr?, error_msg, path)
+    }.on_success {
+      quantity = calculate_quantity(tx_params: tx_params, is_booking: is_booking)
 
-    preauthorize_form = PreauthorizeMessageForm.new(
-      conversation_params.merge(listing_id: listing.id)
-        .merge(booking_data))
+      shipping_total = ShippingTotal.new(
+        initial: listing.shipping_price,
+        additional: listing.shipping_price_additional,
+        quantity: quantity)
 
-    unless preauthorize_form.valid?
-      return render_error_response(
-               request.xhr?,
-               preauthorize_form.errors.full_messages.join(", "),
-               error_path())
-    end
-
-    quantity =
-      if is_booking
-        DateUtils.duration_days(preauthorize_form.start_on, preauthorize_form.end_on)
-      else
-        TransactionViewUtils.parse_quantity(preauthorize_form.quantity)
-      end
-
-    shipping_total = ShippingTotal.new(
-      initial: listing.shipping_price,
-      additional: listing.shipping_price_additional,
-      quantity: quantity)
-
-    booking_fields =
-      if is_booking
-        {
-          start_on: preauthorize_form.start_on,
-          end_on: preauthorize_form.end_on
-        }
-      else
-        {}
-      end
-
-    transaction_response = create_preauth_transaction(
-      {
+      tx_response = create_preauth_transaction(
         payment_type: :paypal,
         community: @current_community,
         listing: listing,
         listing_quantity: quantity,
         user: @current_user,
-        content: preauthorize_form.content,
+        content: tx_params[:message],
         use_async: request.xhr?,
-        delivery_method: delivery_method,
-        shipping_price: shipping_total.total
-      }.merge(booking_fields)
-    )
+        delivery_method: tx_params[:delivery],
+        shipping_price: shipping_total.total,
+        booking_fields: {
+          start_on: tx[:start_on],
+          end_on: tx[:end_on]
+        })
 
-    if !transaction_response[:success]
-      return render_error_response(request.xhr?, t("error_messages.paypal.generic_error"), action: :initiate)
-    elsif (transaction_response[:data][:gateway_fields][:redirect_url])
-      if request.xhr?
-        render json: {
-          redirect_url: transaction_response[:data][:gateway_fields][:redirect_url]
-        }
-      else
-        redirect_to transaction_response[:data][:gateway_fields][:redirect_url]
-      end
-    else
-      render json: {
-        op_status_url: transaction_op_status_path(transaction_response[:data][:gateway_fields][:process_token]),
-        op_error_msg: t("error_messages.paypal.generic_error")
-      }
-    end
+      handle_tx_response(tx_response)
+    }
   end
 
   private
+
+  def add_defaults(params:, shipping_enabled:, pickup_enabled:)
+    default_shipping =
+      case [shipping_enabled, pickup_enabled]
+      when [true, false]
+        {delivery: :shipping}
+      when [false, true]
+        {delivery: :pickup}
+      when [false, false]
+        {delivery: nil}
+      else
+        {}
+      end
+
+    params.merge(default_shipping)
+  end
+
+
+  def handle_tx_response(tx_response)
+    if !tx_response[:success]
+      return render_error_response(request.xhr?, t("error_messages.paypal.generic_error"), action: :initiate)
+    elsif (tx_response[:data][:gateway_fields][:redirect_url])
+      if request.xhr?
+        render json: {
+                 redirect_url: tx_response[:data][:gateway_fields][:redirect_url]
+               }
+      else
+        redirect_to tx_response[:data][:gateway_fields][:redirect_url]
+      end
+    else
+      render json: {
+               op_status_url: transaction_op_status_path(tx_response[:data][:gateway_fields][:process_token]),
+               op_error_msg: t("error_messages.paypal.generic_error")
+             }
+    end
+  end
 
   def calculate_quantity(tx_params:, is_booking:)
     if is_booking
       DateUtils.duration_days(tx_params[:start_on], tx_params[:end_on])
     else
-      params[:quantity]
+      params[:quantity] || 1
     end
   end
 
-  def error_path(booking_data)
-    booking_params =
-      if booking_data.present?
+  def error_path(tx_params)
+    booking_dates = HashUtils.map_values(tx_params.slice(:start_on, :end_on)) { |date|
+      TransactionViewUtils.stringify_booking_date(date)
+    }
 
-        { start_on: TransactionViewUtils.stringify_booking_date(booking_data[:start_on]),
-          end_on: TransactionViewUtils.stringify_booking_date(booking_data[:end_on])
-        }
-      else
-        {}
-      end
-
-    {action: :initiate}.merge(booking_params)
+    {action: :initiate}.merge(booking_dates)
   end
 
   def translate_unit_from_listing(listing)
@@ -400,30 +377,6 @@ class PreauthorizeTransactionsController < ApplicationController
 
   def booking?(listing)
     [:day].include?(listing.unit_type&.to_sym)
-  end
-
-  def parse_quantity_data(listing, params)
-    if booking?(listing)
-      booking = verified_booking_data(params[:start_on], params[:end_on])
-
-      {
-        booking: true,
-        start_on: booking[:start_on],
-        end_on: booking[:end_on],
-        quantity: booking[:duration],
-        duration: booking[:duration],
-        booking_parse_error: booking[:error]
-      }
-    else
-      {
-        booking: false,
-        start_on: nil,
-        end_on: nil,
-        quantity: TransactionViewUtils.parse_quantity(params[:quantity]),
-        duration: nil,
-        booking_parse_error: nil,
-      }
-    end
   end
 
   def render_error_response(is_xhr, error_msg, redirect_params)
@@ -477,35 +430,8 @@ class PreauthorizeTransactionsController < ApplicationController
     end
   end
 
-  def verified_booking_data(start_on, end_on)
-    booking_form = BookingForm.new({
-      start_on: TransactionViewUtils.parse_booking_date(start_on),
-      end_on: TransactionViewUtils.parse_booking_date(end_on)
-    })
-
-    if !booking_form.valid?
-      { error: booking_form.errors.full_messages }
-    else
-      booking_form.to_hash.merge({
-        duration: DateUtils.duration_days(booking_form.start_on, booking_form.end_on)
-      })
-    end
-  end
-
-  def valid_delivery_method(delivery_method_str:, shipping:, pickup:)
-    case [delivery_method_str, shipping, pickup]
-    when matches([nil, true, false]), matches(["shipping", true, __])
-      :shipping
-    when matches([nil, false, true]), matches(["pickup", __, true])
-      :pickup
-    when matches([nil, false, false])
-      nil
-    else
-      :errored
-    end
-  end
-
   def create_preauth_transaction(opts)
+
     # PayPal doesn't like images with cache buster in the URL
     logo_url = Maybe(opts[:community])
                  .wide_logo
