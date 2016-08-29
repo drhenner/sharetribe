@@ -10,32 +10,6 @@ class PreauthorizeTransactionsController < ApplicationController
   before_filter :ensure_authorized_to_reply
   before_filter :ensure_can_receive_payment
 
-  BookingForm = FormUtils.define_form("BookingForm", :start_on, :end_on)
-    .with_validations do
-      validates :start_on, :end_on, presence: true
-      validates_with DateValidator,
-                     attribute: :end_on,
-                     compare_to: :start_on,
-                     restriction: :on_or_after
-    end
-
-  ContactForm = FormUtils.define_form("ListingConversation", :content, :sender_id, :listing_id, :community_id)
-    .with_validations { validates_presence_of :content, :listing_id }
-
-  PreauthorizeMessageForm = FormUtils.define_form("ListingConversation",
-    :content,
-    :sender_id,
-    :contract_agreed,
-    :delivery_method,
-    :quantity,
-    :listing_id,
-    :start_on,
-    :end_on
-   ).with_validations {
-    validates_presence_of :listing_id
-    validates :delivery_method, inclusion: { in: %w(shipping pickup), message: "%{value} is not shipping or pickup." }, allow_nil: true
-  }
-
   IS_POSITIVE = ->(v) {
     return if v.nil?
     unless v.positive?
@@ -43,10 +17,19 @@ class PreauthorizeTransactionsController < ApplicationController
     end
   }
 
+  PARSE_DATE = ->(v) {
+    return if v.nil?
+    begin
+      TransactionViewUtils.parse_booking_date(v)
+    rescue ArgumentError => e
+      e
+    end
+  }
+
   NewTransactionParams = EntityUtils.define_builder(
     [:delivery, :to_symbol, one_of: [nil, :shipping, :pickup]],
-    [:start_on, :date, transform_with: ->(s) { TransactionViewUtils.parse_booking_date(s) }],
-    [:end_on, :date, transform_with: ->(s) { TransactionViewUtils.parse_booking_date(s) }],
+    [:start_on, :date, transform_with: PARSE_DATE],
+    [:end_on, :date, transform_with: PARSE_DATE],
     [:message, :string],
     [:quantity, :to_integer, validate_with: IS_POSITIVE],
     [:contract_agreed, transform_with: ->(v) { v == "1" }]
@@ -132,11 +115,11 @@ class PreauthorizeTransactionsController < ApplicationController
 
       case [delivery, shipping_enabled, pickup_enabled]
       when matches([:shipping, true])
-        Result::Success.new(:shipping)
+        Result::Success.new(params.merge(delivery: :shipping))
       when matches([:pickup, __, true])
-        Result::Success.new(:pickup)
+        Result::Success.new(params.merge(delivery: :pickup))
       when matches([nil, false, false])
-        Result::Success.new(nil)
+        Result::Success.new(params.merge(delivery: :nil))
       else
         Result::Error.new(nil, code: :delivery_method_missing)
       end
@@ -151,10 +134,10 @@ class PreauthorizeTransactionsController < ApplicationController
         elsif start_on > end_on
           Result::Error.new(nil, code: :end_cant_be_before_start)
         else
-          Result::Success.new()
+          Result::Success.new(params)
         end
       else
-        Result::Success.new()
+        Result::Success.new(params)
       end
     end
 
@@ -163,30 +146,32 @@ class PreauthorizeTransactionsController < ApplicationController
 
       if transaction_agreement_in_use
         if contract_agreed
-          Result::Success.new()
+          Result::Success.new(params)
         else
           Result::Error.new(nil, code: :agreement_missing)
         end
       else
-        Result::Success.new()
+        Result::Success.new(params)
       end
     end
   end
 
   def initiate
-    tx_params = add_defaults(
-      params: NewTransactionParams.call(params),
-      shipping_enabled: listing.require_shipping_address,
-      pickup_enabled: listing.pickup_enabled)
+    validation_result = NewTransactionParams.validate(params).and_then { |params_entity|
+      tx_params = add_defaults(
+        params: params_entity,
+        shipping_enabled: listing.require_shipping_address,
+        pickup_enabled: listing.pickup_enabled)
 
-    is_booking = booking?(listing)
+      Validator.validate_initiate_params(params: tx_params,
+                                         is_booking: booking?(listing),
+                                         shipping_enabled: listing.require_shipping_address,
+                                         pickup_enabled: listing.pickup_enabled)
+    }
 
-    validation_result = Validator.validate_initiate_params(params: tx_params,
-                                                           is_booking: is_booking,
-                                                           shipping_enabled: listing.require_shipping_address,
-                                                           pickup_enabled: listing.pickup_enabled)
+    validation_result.on_success { |tx_params|
+      is_booking = booking?(listing)
 
-    validation_result.on_success {
       quantity = calculate_quantity(tx_params: tx_params, is_booking: is_booking)
 
       listing_entity = ListingQuery.listing(params[:listing_id])
@@ -235,35 +220,47 @@ class PreauthorizeTransactionsController < ApplicationController
                  total: order_total.total)
              }
 
-    }.on_error { |msg, data|
+    }
+
+    validation_result.on_error { |msg, data|
       error_msg =
-        case data[:code]
-        when :dates_missing
-          t("listing_conversations.preauthorize.booking_dates_missing")
-        when :end_cant_be_before_start
-          t("listing_conversations.preauthorize.end_cant_be_before_start")
-        when :delivery_method_missing
-          t("listing_conversations.preauthorize.delivery_method_missing")
+        if data.is_a?(Array)
+          # Entity validation failed
+          t("listing_conversations.preauthorize.invalid_parameters")
+        else
+          case data[:code]
+          when :dates_missing
+            t("listing_conversations.preauthorize.booking_dates_missing")
+          when :end_cant_be_before_start
+            t("listing_conversations.preauthorize.end_cant_be_before_start")
+          when :delivery_method_missing
+            t("listing_conversations.preauthorize.delivery_method_missing")
+          else
+            raise NotImplementedError.new("No error handler for: #{msg}, #{data.inspect}")
+          end
         end
 
       flash[:error] = error_msg
-      return redirect_to listing_path(listing.id)
+      logger.error(msg, :transaction_initiate_error, data)
+      redirect_to listing_path(listing.id)
     }
   end
 
   def initiated
-    tx_params = add_defaults(
-      params: NewTransactionParams.call(params),
-      shipping_enabled: listing.require_shipping_address,
-      pickup_enabled: listing.pickup_enabled)
+    validation_result = NewTransactionParams.validate(params).and_then { |params_entity|
+      tx_params = add_defaults(
+        params: params_entity,
+        shipping_enabled: listing.require_shipping_address,
+        pickup_enabled: listing.pickup_enabled)
 
-    is_booking = booking?(listing)
+      is_booking = booking?(listing)
 
-    validation_result = Validator.validate_initiated_params(params: tx_params,
-                                                            is_booking: is_booking,
-                                                            shipping_enabled: listing.require_shipping_address,
-                                                            pickup_enabled: listing.pickup_enabled,
-                                                            transaction_agreement_in_use: @current_community.transaction_agreement_in_use?)
+      Validator.validate_initiated_params(params: tx_params,
+                                          is_booking: is_booking,
+                                          shipping_enabled: listing.require_shipping_address,
+                                          pickup_enabled: listing.pickup_enabled,
+                                          transaction_agreement_in_use: @current_community.transaction_agreement_in_use?)
+    }
 
     validation_result.on_error { |msg, data|
       error_msg, path =
@@ -279,9 +276,11 @@ class PreauthorizeTransactionsController < ApplicationController
         else
           raise NotImplementedError.new("Unknown error #{data[:code]}")
         end
+    }
 
-      render_error_response(request.xhr?, error_msg, path)
-    }.on_success {
+    validation_result.on_success { |tx_params|
+      is_booking = booking?(listing)
+
       quantity = calculate_quantity(tx_params: tx_params, is_booking: is_booking)
 
       shipping_total =
@@ -311,6 +310,30 @@ class PreauthorizeTransactionsController < ApplicationController
 
       handle_tx_response(tx_response)
     }
+
+    validation_result.on_error { |msg, data|
+      error_msg, path =
+                 if data.is_a?(Array)
+                   # Entity validation failed
+                   [t("listing_conversations.preauthorize.invalid_parameters"), listing_path(listing.id)]
+                 else
+                   case data[:code]
+                   when :dates_missing
+                     [t("listing_conversations.preauthorize.booking_dates_missing"), listing_path(listing.id)]
+                   when :end_cant_be_before_start
+                     [t("listing_conversations.preauthorize.end_cant_be_before_start"), listing_path(listing.id)]
+                   when :delivery_method_missing
+                     [t("listing_conversations.preauthorize.delivery_method_missing"), listing_path(listing.id)]
+                   when :agreement_missing
+                     [t("error_messages.transaction_agreement.required_error"), error_path(tx_params)]
+                   else
+                     raise NotImplementedError.new("No error handler for: #{msg}, #{data.inspect}")
+                   end
+                 end
+
+      logger.error(msg, :transaction_initiated_error, data)
+      render_error_response(request.xhr?, error_msg, path)
+    }
   end
 
   private
@@ -331,10 +354,9 @@ class PreauthorizeTransactionsController < ApplicationController
     params.merge(default_shipping)
   end
 
-
   def handle_tx_response(tx_response)
     if !tx_response[:success]
-      return render_error_response(request.xhr?, t("error_messages.paypal.generic_error"), action: :initiate)
+      render_error_response(request.xhr?, t("error_messages.paypal.generic_error"), action: :initiate)
     elsif (tx_response[:data][:gateway_fields][:redirect_url])
       if request.xhr?
         render json: {
@@ -423,7 +445,7 @@ class PreauthorizeTransactionsController < ApplicationController
   def ensure_authorized_to_reply
     unless listing.visible_to?(@current_user, @current_community)
       flash[:error] = t("layouts.notifications.you_are_not_authorized_to_view_this_content")
-      redirect_to search_path and return
+      redirect_to search_path
     end
   end
 
@@ -450,7 +472,7 @@ class PreauthorizeTransactionsController < ApplicationController
 
     unless ready[:data][:result]
       flash[:error] = t("layouts.notifications.listing_author_payment_details_missing")
-      return redirect_to listing_path(listing)
+      redirect_to listing_path(listing)
     end
   end
 

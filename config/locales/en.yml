@@ -1596,6 +1596,7 @@ en:
       end_cant_be_before_start: "End date cannot be before start date"
       delivery_method_missing: "Delivery method missing or invalid"
       booking_dates_missing: "Booking dates missing"
+      invalid_parameters: "Invalid values for new transaction"
     transaction_agreement_checkbox:
       read_more: View.
   mapview:
