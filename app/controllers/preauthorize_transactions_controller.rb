@@ -290,7 +290,7 @@ class PreauthorizeTransactionsController < ApplicationController
             additional: listing.shipping_price_additional,
             quantity: quantity)
         else
-          NoShippingFee
+          NoShippingFee.new
         end
 
       tx_response = create_preauth_transaction(
