@@ -87,71 +87,71 @@ class PreauthorizeTransactionsController < ApplicationController
 
     module_function
 
-    def validate_initiate_params(params:,
+    def validate_initiate_params(tx_params:,
                                  is_booking:,
                                  shipping_enabled:,
                                  pickup_enabled:)
 
-      validate_delivery_method(params: params, shipping_enabled: shipping_enabled, pickup_enabled: pickup_enabled)
-        .and_then { validate_booking(params: params, is_booking: is_booking) }
+      validate_delivery_method(tx_params: tx_params, shipping_enabled: shipping_enabled, pickup_enabled: pickup_enabled)
+        .and_then { validate_booking(tx_params: tx_params, is_booking: is_booking) }
     end
 
-    def validate_initiated_params(params:,
+    def validate_initiated_params(tx_params:,
                                   is_booking:,
                                   shipping_enabled:,
                                   pickup_enabled:,
                                   transaction_agreement_in_use:)
 
-      validate_delivery_method(params: params, shipping_enabled: shipping_enabled, pickup_enabled: pickup_enabled)
-        .and_then { validate_booking(params: params, is_booking: is_booking) }
+      validate_delivery_method(tx_params: tx_params, shipping_enabled: shipping_enabled, pickup_enabled: pickup_enabled)
+        .and_then { validate_booking(tx_params: tx_params, is_booking: is_booking) }
         .and_then {
-          validate_transaction_agreement(params: params,
+          validate_transaction_agreement(tx_params: tx_params,
                                          transaction_agreement_in_use: transaction_agreement_in_use)
         }
     end
 
-    def validate_delivery_method(params:, shipping_enabled:, pickup_enabled:)
-      delivery = params[:delivery]
+    def validate_delivery_method(tx_params:, shipping_enabled:, pickup_enabled:)
+      delivery = tx_params[:delivery]
 
       case [delivery, shipping_enabled, pickup_enabled]
       when matches([:shipping, true])
-        Result::Success.new(params.merge(delivery: :shipping))
+        Result::Success.new(tx_params.merge(delivery: :shipping))
       when matches([:pickup, __, true])
-        Result::Success.new(params.merge(delivery: :pickup))
+        Result::Success.new(tx_params.merge(delivery: :pickup))
       when matches([nil, false, false])
-        Result::Success.new(params.merge(delivery: :nil))
+        Result::Success.new(tx_params.merge(delivery: :nil))
       else
-        Result::Error.new(nil, code: :delivery_method_missing)
+        Result::Error.new(nil, code: :delivery_method_missing, tx_params: tx_params)
       end
     end
 
-    def validate_booking(params:, is_booking:)
+    def validate_booking(tx_params:, is_booking:)
       if is_booking
-        start_on, end_on = params.values_at(:start_on, :end_on)
+        start_on, end_on = tx_params.values_at(:start_on, :end_on)
 
         if start_on.nil? || end_on.nil?
-          Result::Error.new(nil, code: :dates_missing)
+          Result::Error.new(nil, code: :dates_missing, tx_params: tx_params)
         elsif start_on > end_on
-          Result::Error.new(nil, code: :end_cant_be_before_start)
+          Result::Error.new(nil, code: :end_cant_be_before_start, tx_params: tx_params)
         else
-          Result::Success.new(params)
+          Result::Success.new(tx_params)
         end
       else
-        Result::Success.new(params)
+        Result::Success.new(tx_params)
       end
     end
 
-    def validate_transaction_agreement(params:, transaction_agreement_in_use:)
-      contract_agreed = params[:contract_agreed]
+    def validate_transaction_agreement(tx_params:, transaction_agreement_in_use:)
+      contract_agreed = tx_params[:contract_agreed]
 
       if transaction_agreement_in_use
         if contract_agreed
-          Result::Success.new(params)
+          Result::Success.new(tx_params)
         else
-          Result::Error.new(nil, code: :agreement_missing)
+          Result::Error.new(nil, code: :agreement_missing, tx_params: tx_params)
         end
       else
-        Result::Success.new(params)
+        Result::Success.new(tx_params)
       end
     end
   end
@@ -163,7 +163,7 @@ class PreauthorizeTransactionsController < ApplicationController
         shipping_enabled: listing.require_shipping_address,
         pickup_enabled: listing.pickup_enabled)
 
-      Validator.validate_initiate_params(params: tx_params,
+      Validator.validate_initiate_params(tx_params: tx_params,
                                          is_booking: booking?(listing),
                                          shipping_enabled: listing.require_shipping_address,
                                          pickup_enabled: listing.pickup_enabled)
@@ -227,17 +227,10 @@ class PreauthorizeTransactionsController < ApplicationController
         if data.is_a?(Array)
           # Entity validation failed
           t("listing_conversations.preauthorize.invalid_parameters")
+        elsif [:dates_missing, :end_cant_be_before_start, :delivery_method_missing].include?(data[:code])
+          t("listing_conversations.preauthorize.invalid_parameters")
         else
-          case data[:code]
-          when :dates_missing
-            t("listing_conversations.preauthorize.booking_dates_missing")
-          when :end_cant_be_before_start
-            t("listing_conversations.preauthorize.end_cant_be_before_start")
-          when :delivery_method_missing
-            t("listing_conversations.preauthorize.delivery_method_missing")
-          else
-            raise NotImplementedError.new("No error handler for: #{msg}, #{data.inspect}")
-          end
+          raise NotImplementedError.new("No error handler for: #{msg}, #{data.inspect}")
         end
 
       flash[:error] = error_msg
@@ -255,7 +248,7 @@ class PreauthorizeTransactionsController < ApplicationController
 
       is_booking = booking?(listing)
 
-      Validator.validate_initiated_params(params: tx_params,
+      Validator.validate_initiated_params(tx_params: tx_params,
                                           is_booking: is_booking,
                                           shipping_enabled: listing.require_shipping_address,
                                           pickup_enabled: listing.pickup_enabled,
@@ -315,23 +308,19 @@ class PreauthorizeTransactionsController < ApplicationController
       error_msg, path =
                  if data.is_a?(Array)
                    # Entity validation failed
+                   logger.error(msg, :transaction_initiated_error, data)
                    [t("listing_conversations.preauthorize.invalid_parameters"), listing_path(listing.id)]
+
+                 elsif [:dates_missing, :end_cant_be_before_start, :delivery_method_missing].include?(data[:code])
+                   logger.error(msg, :transaction_initiated_error, data)
+                   [t("listing_conversations.preauthorize.invalid_parameters"), listing_path(listing.id)]
+                 elsif data[:code] == :agreement_missing
+                   # User error, no logging here
+                   [t("error_messages.transaction_agreement.required_error"), error_path(data[:tx_params])]
                  else
-                   case data[:code]
-                   when :dates_missing
-                     [t("listing_conversations.preauthorize.booking_dates_missing"), listing_path(listing.id)]
-                   when :end_cant_be_before_start
-                     [t("listing_conversations.preauthorize.end_cant_be_before_start"), listing_path(listing.id)]
-                   when :delivery_method_missing
-                     [t("listing_conversations.preauthorize.delivery_method_missing"), listing_path(listing.id)]
-                   when :agreement_missing
-                     [t("error_messages.transaction_agreement.required_error"), error_path(tx_params)]
-                   else
-                     raise NotImplementedError.new("No error handler for: #{msg}, #{data.inspect}")
-                   end
+                   raise NotImplementedError.new("No error handler for: #{msg}, #{data.inspect}")
                  end
 
-      logger.error(msg, :transaction_initiated_error, data)
       render_error_response(request.xhr?, error_msg, path)
     }
   end
@@ -382,7 +371,7 @@ class PreauthorizeTransactionsController < ApplicationController
   end
 
   def error_path(tx_params)
-    booking_dates = HashUtils.map_values(tx_params.slice(:start_on, :end_on)) { |date|
+    booking_dates = HashUtils.map_values(tx_params.slice(:start_on, :end_on).select(&:present?)) { |date|
       TransactionViewUtils.stringify_booking_date(date)
     }
 
