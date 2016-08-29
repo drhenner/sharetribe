@@ -188,7 +188,54 @@ class PreauthorizeTransactionsController < ApplicationController
                                                            shipping_enabled: listing.require_shipping_address,
                                                            pickup_enabled: listing.pickup_enabled)
 
-    validation_result.on_error { |msg, data|
+    validation_result.on_success {
+      quantity = calculate_quantity(tx_params: tx_params, is_booking: is_booking)
+
+      listing_entity = ListingQuery.listing(params[:listing_id])
+
+      item_total = ItemTotal.new(
+        unit_price: listing_entity[:price],
+        quantity: quantity)
+
+      shipping_total = ShippingTotal.new(
+        initial: listing_entity[:shipping_price],
+        additional: listing_entity[:shipping_price_additional],
+        quantity: quantity)
+
+      order_total = OrderTotal.new(
+        item_total: item_total,
+        shipping_total: shipping_total
+      )
+
+      render "listing_conversations/initiate",
+             locals: {
+               preauthorize_form: PreauthorizeMessageForm.new(
+                 start_on: tx_params[:start_on],
+                 end_on: tx_params[:end_on]
+               ),
+               listing: listing_entity,
+               delivery_method: tx_params[:delivery],
+               quantity: quantity,
+               author: query_person_entity(listing_entity[:author_id]),
+               action_button_label: translate(listing_entity[:action_button_tr_key]),
+               expiration_period: MarketplaceService::Transaction::Entity.authorization_expiration_period(:paypal),
+               form_action: initiated_order_path(person_id: @current_user.id, listing_id: listing_entity[:id]),
+               country_code: LocalizationUtils.valid_country_code(@current_community.country),
+               price_break_down_locals: TransactionViewUtils.price_break_down_locals(
+                 booking:  is_booking,
+                 quantity: quantity,
+                 start_on: tx_params[:start_on],
+                 end_on:   tx_params[:end_on],
+                 duration: quantity,
+                 listing_price: listing_entity[:price],
+                 localized_unit_type: translate_unit_from_listing(listing_entity),
+                 localized_selector_label: translate_selector_label_from_listing(listing_entity),
+                 subtotal: subtotal_to_show(order_total),
+                 shipping_price: shipping_price_to_show(tx_params[:delivery], shipping_total),
+                 total: order_total.total)
+             }
+
+    }.on_error { |msg, data|
       case data[:code]
       when :dates_missing
         flash[:error] = "Dates missing"
@@ -201,52 +248,6 @@ class PreauthorizeTransactionsController < ApplicationController
         return redirect_to listing_path(listing.id)
       end
     }
-
-    quantity_data = parse_quantity_data(listing, params)
-
-    listing_entity = ListingQuery.listing(params[:listing_id])
-
-    item_total = ItemTotal.new(
-      unit_price: listing_entity[:price],
-      quantity: quantity_data[:quantity])
-
-    shipping_total = ShippingTotal.new(
-      initial: listing_entity[:shipping_price],
-      additional: listing_entity[:shipping_price_additional],
-      quantity: quantity_data[:quantity])
-
-    order_total = OrderTotal.new(
-      item_total: item_total,
-      shipping_total: shipping_total
-    )
-
-    render "listing_conversations/initiate",
-           locals: {
-             preauthorize_form: PreauthorizeMessageForm.new(
-               start_on: quantity_data[:start_on],
-               end_on: quantity_data[:end_on]
-             ),
-             listing: listing_entity,
-             delivery_method: tx_params[:delivery],
-             quantity: quantity_data[:quantity],
-             author: query_person_entity(listing_entity[:author_id]),
-             action_button_label: translate(listing_entity[:action_button_tr_key]),
-             expiration_period: MarketplaceService::Transaction::Entity.authorization_expiration_period(:paypal),
-             form_action: initiated_order_path(person_id: @current_user.id, listing_id: listing_entity[:id]),
-             country_code: LocalizationUtils.valid_country_code(@current_community.country),
-             price_break_down_locals: TransactionViewUtils.price_break_down_locals(
-               booking:  quantity_data[:booking],
-               quantity: quantity_data[:quantity],
-               start_on: quantity_data[:start_on],
-               end_on:   quantity_data[:end_on],
-               duration: quantity_data[:duration],
-               listing_price: listing_entity[:price],
-               localized_unit_type: translate_unit_from_listing(listing_entity),
-               localized_selector_label: translate_selector_label_from_listing(listing_entity),
-               subtotal: subtotal_to_show(order_total),
-               shipping_price: shipping_price_to_show(tx_params[:delivery], shipping_total),
-               total: order_total.total)
-           }
   end
 
   def initiated
@@ -342,6 +343,14 @@ class PreauthorizeTransactionsController < ApplicationController
   end
 
   private
+
+  def calculate_quantity(tx_params:, is_booking:)
+    if is_booking
+      DateUtils.duration_days(tx_params[:start_on], tx_params[:end_on])
+    else
+      params[:quantity]
+    end
+  end
 
   def error_path(booking_data)
     booking_params =
