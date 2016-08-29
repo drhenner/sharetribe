@@ -36,12 +36,19 @@ class PreauthorizeTransactionsController < ApplicationController
     validates :delivery_method, inclusion: { in: %w(shipping pickup), message: "%{value} is not shipping or pickup." }, allow_nil: true
   }
 
+  IS_POSITIVE = ->(v) {
+    return if v.nil?
+    unless v.positive?
+      {code: :positive_integer, msg: "Value must be a positive integer"}
+    end
+  }
+
   NewTransactionParams = EntityUtils.define_builder(
     [:delivery, :to_symbol, one_of: [nil, :shipping, :pickup]],
     [:start_on, :date, transform_with: ->(s) { TransactionViewUtils.parse_booking_date(s) }],
     [:end_on, :date, transform_with: ->(s) { TransactionViewUtils.parse_booking_date(s) }],
     [:message, :string],
-    [:quantity, transform_with: ->(v) { v.to_i unless v.blank? }],
+    [:quantity, :to_integer, validate_with: IS_POSITIVE],
     [:contract_agreed, transform_with: ->(v) { v == "1" }],
   )
 
@@ -71,6 +78,12 @@ class PreauthorizeTransactionsController < ApplicationController
 
     def total
       initial + (additional * (quantity - 1))
+    end
+  end
+
+  class NoShippingFee
+    def total
+      0
     end
   end
 
@@ -120,7 +133,7 @@ class PreauthorizeTransactionsController < ApplicationController
       when matches([:shipping, true])
         Result::Success.new(:shipping)
       when matches([:pickup, __, true])
-        Result::Successn.new(:pickup)
+        Result::Success.new(:pickup)
       when matches([nil, false, false])
         Result::Success.new(nil)
       else
@@ -181,10 +194,15 @@ class PreauthorizeTransactionsController < ApplicationController
         unit_price: listing_entity[:price],
         quantity: quantity)
 
-      shipping_total = ShippingTotal.new(
-        initial: listing_entity[:shipping_price],
-        additional: listing_entity[:shipping_price_additional],
-        quantity: quantity)
+      shipping_total =
+        if tx_params[:delivery] == :shipping
+          ShippingTotal.new(
+            initial: listing_entity[:shipping_price],
+            additional: listing_entity[:shipping_price_additional],
+            quantity: quantity)
+        else
+          NoShippingFee.new
+        end
 
       order_total = OrderTotal.new(
         item_total: item_total,
@@ -265,10 +283,15 @@ class PreauthorizeTransactionsController < ApplicationController
     }.on_success {
       quantity = calculate_quantity(tx_params: tx_params, is_booking: is_booking)
 
-      shipping_total = ShippingTotal.new(
-        initial: listing.shipping_price,
-        additional: listing.shipping_price_additional,
-        quantity: quantity)
+      shipping_total =
+        if tx_params[:delivery] == :shipping
+          ShippingTotal.new(
+            initial: listing.shipping_price,
+            additional: listing.shipping_price_additional,
+            quantity: quantity)
+        else
+          NoShippingFee
+        end
 
       tx_response = create_preauth_transaction(
         payment_type: :paypal,
@@ -281,8 +304,8 @@ class PreauthorizeTransactionsController < ApplicationController
         delivery_method: tx_params[:delivery],
         shipping_price: shipping_total.total,
         booking_fields: {
-          start_on: tx[:start_on],
-          end_on: tx[:end_on]
+          start_on: tx_params[:start_on],
+          end_on: tx_params[:end_on]
         })
 
       handle_tx_response(tx_response)
@@ -331,7 +354,7 @@ class PreauthorizeTransactionsController < ApplicationController
     if is_booking
       DateUtils.duration_days(tx_params[:start_on], tx_params[:end_on])
     else
-      params[:quantity] || 1
+      tx_params[:quantity] || 1
     end
   end
 

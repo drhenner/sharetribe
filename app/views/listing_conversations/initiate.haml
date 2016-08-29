@@ -43,10 +43,11 @@
       - if @current_community.transaction_agreement_in_use
         = render :partial => "listing_conversations/transaction_agreement_checkbox"
 
-      - if local_assigns.has_key?(:quantity)
+      - if quantity
         = hidden_field_tag :quantity, quantity
 
-      = hidden_field_tag :delivery, delivery_method
+      - if delivery_method
+        = hidden_field_tag :delivery, delivery_method
 
       .row
         .col-12.paypal-button-wrapper
