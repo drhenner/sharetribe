@@ -49,7 +49,7 @@ class PreauthorizeTransactionsController < ApplicationController
     [:end_on, :date, transform_with: ->(s) { TransactionViewUtils.parse_booking_date(s) }],
     [:message, :string],
     [:quantity, :to_integer, validate_with: IS_POSITIVE],
-    [:contract_agreed, transform_with: ->(v) { v == "1" }],
+    [:contract_agreed, transform_with: ->(v) { v == "1" }]
   )
 
   ListingQuery = MarketplaceService::Listing::Query
@@ -121,9 +121,10 @@ class PreauthorizeTransactionsController < ApplicationController
 
       validate_delivery_method(params: params, shipping_enabled: shipping_enabled, pickup_enabled: pickup_enabled)
         .and_then { validate_booking(params: params, is_booking: is_booking) }
-        .and_then { validate_transaction_agreement(
-                      params: params,
-                      transaction_agreement_in_use: transaction_agreement_in_use)}
+        .and_then {
+          validate_transaction_agreement(params: params,
+                                         transaction_agreement_in_use: transaction_agreement_in_use)
+        }
     end
 
     def validate_delivery_method(params:, shipping_enabled:, pickup_enabled:)
@@ -266,18 +267,18 @@ class PreauthorizeTransactionsController < ApplicationController
 
     validation_result.on_error { |msg, data|
       error_msg, path =
-                 case data[:code]
-                 when :dates_missing
-                   [t("listing_conversations.preauthorize.booking_dates_missing"), listing_path(listing.id)]
-                 when :end_cant_be_before_start
-                   [t("listing_conversations.preauthorize.end_cant_be_before_start"), listing_path(listing.id)]
-                 when :delivery_method_missing
-                   [t("listing_conversations.preauthorize.delivery_method_missing"), listing_path(listing.id)]
-                 when :agreement_missing
-                   [t("error_messages.transaction_agreement.required_error"), error_path(tx_params)]
-                 else
-                   raise NotImplementedError.new("Unknown error #{data[:code]}")
-                 end
+        case data[:code]
+        when :dates_missing
+          [t("listing_conversations.preauthorize.booking_dates_missing"), listing_path(listing.id)]
+        when :end_cant_be_before_start
+          [t("listing_conversations.preauthorize.end_cant_be_before_start"), listing_path(listing.id)]
+        when :delivery_method_missing
+          [t("listing_conversations.preauthorize.delivery_method_missing"), listing_path(listing.id)]
+        when :agreement_missing
+          [t("error_messages.transaction_agreement.required_error"), error_path(tx_params)]
+        else
+          raise NotImplementedError.new("Unknown error #{data[:code]}")
+        end
 
       render_error_response(request.xhr?, error_msg, path)
     }.on_success {
