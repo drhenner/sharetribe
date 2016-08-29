@@ -36,6 +36,15 @@ class PreauthorizeTransactionsController < ApplicationController
     validates :delivery_method, inclusion: { in: %w(shipping pickup), message: "%{value} is not shipping or pickup." }, allow_nil: true
   }
 
+  NewTransactionParams = EntityUtils.define_builder(
+    [:delivery, :to_symbol, one_of: [nil, :shipping, :pickup]],
+    [:start_on, :date, transform_with: ->(s) { TransactionViewUtils.parse_booking_date(s) }],
+    [:end_on, :date, transform_with: ->(s) { TransactionViewUtils.parse_booking_date(s) }],
+    [:message, :string],
+    [:quantity, :to_integer, default: 1],
+    [:contract_agreed],
+  )
+
   ListingQuery = MarketplaceService::Listing::Query
 
   class ItemTotal
@@ -78,20 +87,122 @@ class PreauthorizeTransactionsController < ApplicationController
     end
   end
 
-  def initiate
-    delivery_method = valid_delivery_method(delivery_method_str: params[:delivery],
-                                            shipping: listing.require_shipping_address,
-                                            pickup: listing.pickup_enabled)
-    if(delivery_method == :errored)
-      return redirect_to error_not_found_path
+  module Validator
+
+    module_function
+
+    def validate_initiate_params(params:,
+                                 is_booking:,
+                                 shipping_enabled:,
+                                 pickup_enabled:)
+
+      validate_delivery_method(params: params, shipping_enabled: shipping_enabled, pickup_enabled: pickup_enabled)
+        .and_then { validate_booking(params: params, is_booking: is_booking) }
     end
+
+    def validate_initiated_params(params:,
+                                  is_booking:,
+                                  shipping_enabled:,
+                                  pickup_enabled:,
+                                  transaction_agreement_in_use:)
+
+      validate_delivery_method(params: params, shipping_enabled: shipping_enabled, pickup_enabled: pickup_enabled)
+        .and_then { validate_booking(params: params, is_booking: is_booking) }
+        .and_then { validate_transaction_agreement(
+                      params: params,
+                      transaction_agreement_in_use: transaction_agreement_in_use)}
+    end
+
+    def validate_delivery_method(params:, shipping_enabled:, pickup_enabled:)
+      delivery = params[:delivery]
+
+      case [delivery, shipping_enabled, pickup_enabled]
+      when matches([:shipping, true])
+        Result::Success.new(:shipping)
+      when matches([:pickup, __, true])
+        Result::Successn.new(:pickup)
+      when matches([nil, false, false])
+        Result::Success.new(nil)
+      else
+        Result::Error.new(nil, code: :delivery_method_missing)
+      end
+    end
+
+    def validate_booking(params:, is_booking:)
+      if is_booking
+        start_on, end_on = params.values_at(:start_on, :end_on)
+
+        if start_on.nil? || end_on.nil?
+          Result::Error.new(nil, code: :dates_missing)
+        elsif start_on > end_on
+          Result::Error.new(nil, code: :start_must_be_before_end)
+        else
+          Result::Success.new()
+        end
+      else
+        Result::Success.new()
+      end
+    end
+
+    def validate_transaction_agreement(params:, transaction_agreement_in_use:)
+      contract_agreed = params[:contract_agreed]
+
+      if transaction_agreement_in_use
+        if contract_agreed.present?
+          Result::Success.new()
+        else
+          Result::Error.new(nil, code: :agreement_missing)
+        end
+      else
+        Result::Success.new()
+      end
+    end
+  end
+
+  def add_defaults(params:, shipping_enabled:, pickup_enabled:)
+    default_shipping =
+      case [shipping_enabled, pickup_enabled]
+      when [true, false]
+        {delivery: :shipping}
+      when [false, true]
+        {delivery: :pickup}
+      when [false, false]
+        {delivery: nil}
+      else
+        {}
+      end
+
+    params.merge(default_shipping)
+  end
+
+  def initiate
+    tx_params = add_defaults(
+      params: NewTransactionParams.call(params),
+      shipping_enabled: listing.require_shipping_address,
+      pickup_enabled: listing.pickup_enabled)
+
+    is_booking = booking?(listing)
+
+    validation_result = Validator.validate_initiate_params(params: tx_params,
+                                                           is_booking: is_booking,
+                                                           shipping_enabled: listing.require_shipping_address,
+                                                           pickup_enabled: listing.pickup_enabled)
+
+    validation_result.on_error { |msg, data|
+      case data[:code]
+      when :dates_missing
+        flash[:error] = "Dates missing"
+        return redirect_to listing_path(listing.id)
+      when :start_must_be_before_end
+        flash[:error] = "Start must be after end"
+        return redirect_to listing_path(listing.id)
+      when :delivery_method_missing
+        flash[:error] = "Delivery method missing"
+        return redirect_to listing_path(listing.id)
+      end
+    }
 
     quantity_data = parse_quantity_data(listing, params)
-
-    if quantity_data[:booking_parse_error].present?
-      flash[:error] = quantity_data[:booking_parse_error]
-      return redirect_to listing_path(listing_entity[:id])
-    end
 
     listing_entity = ListingQuery.listing(params[:listing_id])
 
@@ -116,7 +227,7 @@ class PreauthorizeTransactionsController < ApplicationController
                end_on: quantity_data[:end_on]
              ),
              listing: listing_entity,
-             delivery_method: delivery_method,
+             delivery_method: tx_params[:delivery],
              quantity: quantity_data[:quantity],
              author: query_person_entity(listing_entity[:author_id]),
              action_button_label: translate(listing_entity[:action_button_tr_key]),
@@ -133,12 +244,14 @@ class PreauthorizeTransactionsController < ApplicationController
                localized_unit_type: translate_unit_from_listing(listing_entity),
                localized_selector_label: translate_selector_label_from_listing(listing_entity),
                subtotal: subtotal_to_show(order_total),
-               shipping_price: shipping_price_to_show(delivery_method, shipping_total),
+               shipping_price: shipping_price_to_show(tx_params[:delivery], shipping_total),
                total: order_total.total)
            }
   end
 
   def initiated
+    tx_params = NewTransactionParams.call(params)
+
     conversation_params = params[:listing_conversation]
     is_booking = booking?(listing)
 
