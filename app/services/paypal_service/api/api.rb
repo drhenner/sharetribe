@@ -5,7 +5,6 @@ module PaypalService::API
     if Rails.env.test?
       FakeApiImplementation
     else
-      FakeApiImplementation
-      # ApiImplementation
+      ApiImplementation
     end
 end
